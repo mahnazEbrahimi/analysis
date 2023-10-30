@@ -1,0 +1,145 @@
+version: 2.1
+
+orbs:
+  aws-ecr-eks: signavio/aws-ecr-eks@3.0.1
+  aws-ecr: circleci/aws-ecr@8.2.1
+  owasp: entur/owasp@0.0.18
+  slack: circleci/slack@4.4.0
+  blackduck: signavio/blackduck@1.16.2
+  cumulus: signavio/cumulus@0.0.2
+
+executors:
+  fortify:
+    machine:
+      image: ubuntu-2004:202104-01
+    resource_class: 2xlarge
+
+aliases:
+  - &onlyMain
+    filters:
+      branches:
+        only:
+          - main
+  # See: https://support.circleci.com/hc/en-us/articles/360047082992-Send-slack-notification-at-end-of-workflow
+  - &notifyFailure
+    post-steps:
+      - slack/notify:
+          event: fail
+          mentions: '@fgdfg'
+          template: basic_fail_1
+  - &notifyFailureOnlyMain
+    post-steps:
+      - slack/notify:
+          event: fail
+          mentions: '@fgdfg'
+          template: basic_fail_1
+          branch_pattern: main
+jobs:
+  build:
+    resource_class: xlarge
+    docker:
+      - image: cimg/openjdk:11.0
+    steps:
+      - checkout
+      - run:
+          name: Ensure branch is based on latest main
+          command: .circleci/latest_main_check.sh
+      - restore_cache:
+          keys:
+            - gradle-cache1-{{ .Branch }}-{{ checksum "build.gradle.kts" }}
+            # if cache for exact version is not present then load any most recent one
+            - gradle-cache1-{{ .Branch }}-
+            - gradle-cache1-
+      - run:
+          name: Build and test app
+          command: |
+            echo "org.gradle.jvmargs=-Xmx1500M" > gradle.properties && echo "org.gradle.workers.max=2" >> gradle.properties
+            echo "org.gradle.daemon=false" >> gradle.properties
+            chmod +x ./gradlew
+            ./gradlew build shadowJar | tee ./build.log
+      - store_test_results:
+          path: build/test-results
+      - run:
+          name: Upload test coverage report to coveralls.io
+          command: |
+            ./gradlew coveralls
+      - save_cache:
+          paths:
+            - ~/.gradle/caches
+            - ~/.gradle/wrapper
+          key: gradle-cache1-{{ .Branch }}-{{ checksum "build.gradle.kts" }}
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build
+            - build.log
+
+workflows:
+  build-and-deploy:
+    jobs:
+      - owasp/gradle_owasp_dependency_check:
+          # https://circleci.com/developer/orbs/orb/entur/owasp
+          # Reports are persisted as artifacts under the directory 'Report/OWASP'.
+          context:
+            - Slack
+          cache_key: owasp-7
+          <<: *notifyFailureOnlyMain
+      - build:
+          context:
+            - ECR
+            - Slack
+          <<: *notifyFailureOnlyMain
+      - cumulus/cumulus-upload:
+          requires:
+            - build
+          context:
+            - PROCESS_INTELLIGENCE_CUMULUS
+          files: "log:./build.log"
+          <<: *onlyMain
+      - aws-ecr-eks/build-push-restart:
+          name: build-push-restart
+          context:
+            - ECR
+            - Slack
+          repo: spi-analysis
+          deployment_name: spi-analysis
+          additional_deployment_name: 
+          k8s_namespace: spi
+          eks_cluster_name: EKS_NAME_SCOS
+          eks_account_id: EKS_ACCOUNT_ID_SCOS
+          requires:
+            - build
+          <<: *onlyMain
+          <<: *notifyFailure
+  owasp-check:
+    triggers:
+      - schedule:
+          cron: "55 1 * * *"
+          <<: *onlyMain
+    jobs:
+      - owasp/gradle_owasp_dependency_check:
+          context:
+            - Slack
+          cache_key: owasp-7
+          <<: *notifyFailure
+  blackduck-nightly-scan:
+    triggers:
+      - schedule:
+          cron: "30 2 * * *" # UTC
+          <<: *onlyMain
+    jobs:
+      - build:
+          name: build-for-blackduck
+          context: ECR
+      - blackduck/blackduck-scan:
+          context:
+            - ECR
+            - BlackDuck
+          blackduck-project-group: 
+          blackduck-project-name: spi-analysis
+          blackduck-project-path: /home/circleci/project
+          timeout: 40m
+          requires:
+            - build-for-blackduck
+          <<: *notifyFailure
+
